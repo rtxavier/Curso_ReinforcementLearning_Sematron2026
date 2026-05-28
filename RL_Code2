@@ -1,0 +1,967 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+import random
+from collections import deque
+
+# =========================================================
+# RESCUEBOT RL 2.0
+# Versão estável para aula:
+# - cenário V1
+# - Q-table simples
+# - 3 sensores visuais
+# - heatmap corrigido
+# - dashboard sem sobreposição
+# =========================================================
+
+GRID_SIZE = 12
+
+START = (0, 0)
+PACKAGE = (9, 2)
+HOSPITAL = (11, 11)
+
+OBSTACLES = {
+    (1, 3), (2, 3), (3, 3), (4, 3),
+    (6, 1), (6, 2), (6, 3), (6, 4),
+    (2, 7), (3, 7), (4, 7), (5, 7),
+    (8, 6), (8, 7), (8, 8),
+    (10, 4), (10, 5), (10, 6)
+}
+
+DANGER_ZONES = {
+    (3, 1), (4, 1),
+    (5, 5), (6, 5),
+    (7, 9), (9, 9),
+    (10, 9)
+}
+
+ACTIONS = {
+    0: (-1, 0),  # cima
+    1: (1, 0),   # baixo
+    2: (0, -1),  # esquerda
+    3: (0, 1)    # direita
+}
+
+ACTION_SYMBOLS = {
+    0: "↑",
+    1: "↓",
+    2: "←",
+    3: "→"
+}
+
+DIRECTION_NAMES = {
+    0: "cima",
+    1: "baixo",
+    2: "esquerda",
+    3: "direita",
+    4: "no alvo"
+}
+
+# Estado simples:
+# linha, coluna, carregando pacote, ação
+q_table = np.zeros((GRID_SIZE, GRID_SIZE, 2, 4))
+
+alpha = 0.18
+gamma = 0.95
+
+epsilon = 1.0
+epsilon_decay = 0.965
+epsilon_min = 0.03
+
+episodes = 300
+max_steps = 180
+
+episode = 0
+state = START
+has_package = 0
+step_counter = 0
+total_reward = 0
+
+rewards_history = []
+success_history = deque(maxlen=50)
+episode_success_full = []
+current_path = [START]
+
+training_finished = False
+colorbar = None
+
+
+# =========================================================
+# AMBIENTE
+# =========================================================
+
+def valid_position(pos):
+    x, y = pos
+
+    if x < 0 or x >= GRID_SIZE:
+        return False
+
+    if y < 0 or y >= GRID_SIZE:
+        return False
+
+    if pos in OBSTACLES:
+        return False
+
+    return True
+
+
+def manhattan(a, b):
+    return abs(a[0] - b[0]) + abs(a[1] - b[1])
+
+
+# =========================================================
+# SENSORES VISUAIS
+# =========================================================
+
+def obstacle_sensor(pos):
+    """
+    Sensor 1: radar de obstáculo.
+    Retorna valores de 0 a 1 para cima, baixo, esquerda e direita.
+    Quanto maior, mais livre está a direção.
+    """
+
+    readings = []
+
+    for action in [0, 1, 2, 3]:
+        dx, dy = ACTIONS[action]
+        distance = 0
+        current = pos
+
+        while distance < 4:
+            nxt = (current[0] + dx, current[1] + dy)
+
+            if not valid_position(nxt):
+                break
+
+            distance += 1
+            current = nxt
+
+        readings.append(distance / 4)
+
+    return readings
+
+
+def danger_sensor(pos):
+    """
+    Sensor 2: proximidade de zona de risco.
+    0 = seguro
+    1 = muito perigoso
+    """
+
+    min_dist = 99
+
+    for danger in DANGER_ZONES:
+        d = manhattan(pos, danger)
+        min_dist = min(min_dist, d)
+
+    return max(0, 1 - min_dist / 5)
+
+
+def target_sensor(pos, has_package):
+    """
+    Sensor 3: bússola para o objetivo atual.
+    Antes do pacote, aponta para PACKAGE.
+    Depois do pacote, aponta para HOSPITAL.
+    """
+
+    target = PACKAGE if has_package == 0 else HOSPITAL
+
+    dx = target[0] - pos[0]
+    dy = target[1] - pos[1]
+
+    if dx == 0 and dy == 0:
+        return 4, (0, 0)
+
+    if abs(dx) > abs(dy):
+        if dx < 0:
+            return 0, (dx, dy)
+        return 1, (dx, dy)
+
+    if dy < 0:
+        return 2, (dx, dy)
+
+    return 3, (dx, dy)
+
+
+def get_all_sensors(pos, has_package):
+    radar = obstacle_sensor(pos)
+    danger = danger_sensor(pos)
+    target_dir, target_vector = target_sensor(pos, has_package)
+
+    return radar, danger, target_dir, target_vector
+
+
+# =========================================================
+# Q-LEARNING
+# =========================================================
+
+def choose_action(pos, mode):
+    global epsilon
+
+    if random.random() < epsilon:
+        return random.choice(list(ACTIONS.keys()))
+
+    x, y = pos
+    return np.argmax(q_table[x, y, mode])
+
+
+def environment_step(pos, mode, action):
+    dx, dy = ACTIONS[action]
+
+    next_pos = (
+        pos[0] + dx,
+        pos[1] + dy
+    )
+
+    reward = -1
+    done = False
+    next_mode = mode
+
+    # Colisão com parede/obstáculo
+    if not valid_position(next_pos):
+        return pos, mode, -15, False
+
+    # Zona perigosa
+    if next_pos in DANGER_ZONES:
+        reward -= 12
+
+    # Pegou pacote
+    if next_pos == PACKAGE and mode == 0:
+        reward += 80
+        next_mode = 1
+
+    # Chegou ao hospital sem pacote
+    if next_pos == HOSPITAL and mode == 0:
+        reward -= 5
+
+    # Entregou pacote
+    if next_pos == HOSPITAL and mode == 1:
+        reward += 150
+        done = True
+
+    # Reward shaping por aproximação ao alvo certo
+    target = PACKAGE if mode == 0 else HOSPITAL
+
+    old_dist = manhattan(pos, target)
+    new_dist = manhattan(next_pos, target)
+
+    if new_dist < old_dist:
+        reward += 2
+    else:
+        reward -= 1
+
+    return next_pos, next_mode, reward, done
+
+
+def get_best_action(pos, mode):
+    x, y = pos
+    return np.argmax(q_table[x, y, mode])
+
+
+def get_value(pos, mode):
+    x, y = pos
+    return np.max(q_table[x, y, mode])
+
+
+def get_policy_strength(pos, mode):
+    x, y = pos
+    values = q_table[x, y, mode]
+    return np.max(values) - np.min(values)
+
+
+# =========================================================
+# DASHBOARD
+# =========================================================
+
+plt.style.use("dark_background")
+
+fig = plt.figure(figsize=(20, 10))
+
+# Layout mais limpo:
+# mapa grande à esquerda
+# reward/métricas/heatmap no centro
+# sensores/info à direita
+gs = fig.add_gridspec(4, 5)
+
+ax_map = fig.add_subplot(gs[:, 0:2])
+ax_reward = fig.add_subplot(gs[0, 2:4])
+ax_metrics = fig.add_subplot(gs[1, 2:4])
+ax_value = fig.add_subplot(gs[2:, 2:4])
+ax_sensors = fig.add_subplot(gs[0:3, 4])
+ax_info = fig.add_subplot(gs[3, 4])
+
+fig.suptitle(
+    "RescueBot RL 2.0 — Q-Learning com Política, Heatmap e Sensores Visuais",
+    fontsize=18,
+    fontweight="bold"
+)
+
+
+def draw_map():
+    ax_map.clear()
+
+    mission = "BUSCAR PACOTE" if has_package == 0 else "ENTREGAR NO HOSPITAL"
+
+    ax_map.set_title(
+        f"Mapa da missão | {mission}",
+        fontsize=13,
+        fontweight="bold",
+        pad=10
+    )
+
+    ax_map.set_xlim(-0.5, GRID_SIZE - 0.5)
+    ax_map.set_ylim(-0.5, GRID_SIZE - 0.5)
+    ax_map.set_xticks(range(GRID_SIZE))
+    ax_map.set_yticks(range(GRID_SIZE))
+    ax_map.grid(True, alpha=0.22)
+    ax_map.invert_yaxis()
+
+    mode = has_package
+
+    for i in range(GRID_SIZE):
+        for j in range(GRID_SIZE):
+            pos = (i, j)
+
+            if pos in OBSTACLES:
+                ax_map.add_patch(
+                    plt.Rectangle(
+                        (j - 0.5, i - 0.5),
+                        1,
+                        1,
+                        color="gray",
+                        alpha=0.9
+                    )
+                )
+                ax_map.text(j, i, "X", ha="center", va="center", fontsize=10)
+                continue
+
+            if pos in DANGER_ZONES:
+                ax_map.add_patch(
+                    plt.Rectangle(
+                        (j - 0.5, i - 0.5),
+                        1,
+                        1,
+                        color="red",
+                        alpha=0.35
+                    )
+                )
+                ax_map.text(j, i, "!", ha="center", va="center", fontsize=12)
+
+            if pos == START:
+                ax_map.add_patch(
+                    plt.Rectangle(
+                        (j - 0.5, i - 0.5),
+                        1,
+                        1,
+                        color="blue",
+                        alpha=0.35
+                    )
+                )
+                ax_map.text(j, i, "BASE", ha="center", va="center", fontsize=7)
+
+            if pos == PACKAGE:
+                ax_map.add_patch(
+                    plt.Rectangle(
+                        (j - 0.5, i - 0.5),
+                        1,
+                        1,
+                        color="orange",
+                        alpha=0.70
+                    )
+                )
+                ax_map.text(j, i, "PKG", ha="center", va="center", fontsize=8)
+
+            if pos == HOSPITAL:
+                ax_map.add_patch(
+                    plt.Rectangle(
+                        (j - 0.5, i - 0.5),
+                        1,
+                        1,
+                        color="green",
+                        alpha=0.70
+                    )
+                )
+                ax_map.text(j, i, "H", ha="center", va="center", fontsize=14, fontweight="bold")
+
+            # Política aprendida
+            if pos not in OBSTACLES and pos not in {PACKAGE, HOSPITAL}:
+                if np.max(q_table[i, j, mode]) != 0:
+                    best_action = get_best_action(pos, mode)
+                    strength = get_policy_strength(pos, mode)
+
+                    alpha_arrow = min(1.0, max(0.15, 0.2 + strength / 120))
+
+                    ax_map.text(
+                        j,
+                        i,
+                        ACTION_SYMBOLS[best_action],
+                        ha="center",
+                        va="center",
+                        fontsize=14,
+                        alpha=alpha_arrow,
+                        color="cyan",
+                        fontweight="bold"
+                    )
+
+    # Caminho atual
+    if len(current_path) > 1:
+        ys = [p[0] for p in current_path]
+        xs = [p[1] for p in current_path]
+
+        ax_map.plot(
+            xs,
+            ys,
+            color="white",
+            linewidth=2,
+            alpha=0.60
+        )
+
+    # Sensores no mapa
+    radar, danger, target_dir, target_vector = get_all_sensors(state, has_package)
+
+    # Radar amarelo
+    for action, reading in enumerate(radar):
+        dx, dy = ACTIONS[action]
+        length = reading * 4
+
+        ax_map.arrow(
+            state[1],
+            state[0],
+            dy * length,
+            dx * length,
+            head_width=0.16,
+            head_length=0.22,
+            color="yellow",
+            alpha=0.75,
+            length_includes_head=True
+        )
+
+    # Bússola verde
+    target = PACKAGE if has_package == 0 else HOSPITAL
+
+    ax_map.arrow(
+        state[1],
+        state[0],
+        (target[1] - state[1]) * 0.10,
+        (target[0] - state[0]) * 0.10,
+        head_width=0.25,
+        head_length=0.35,
+        color="lime",
+        alpha=0.85,
+        length_includes_head=True
+    )
+
+    # Robô
+    ax_map.plot(
+        state[1],
+        state[0],
+        "o",
+        markersize=18,
+        color="yellow"
+    )
+
+    ax_map.text(
+        state[1],
+        state[0],
+        "R+" if has_package else "R",
+        ha="center",
+        va="center",
+        fontsize=8,
+        color="black",
+        fontweight="bold"
+    )
+
+    # Legenda enxuta dentro do mapa
+    ax_map.text(
+        0.01,
+        -0.07,
+        "Amarelo = radar | Verde = bússola | Ciano = política aprendida",
+        transform=ax_map.transAxes,
+        fontsize=9
+    )
+
+
+def draw_reward_graph():
+    ax_reward.clear()
+
+    ax_reward.set_title("Reward por episódio + média móvel", fontsize=12, pad=8)
+    ax_reward.set_xlabel("Episódio", fontsize=9)
+    ax_reward.set_ylabel("Reward", fontsize=9)
+    ax_reward.grid(True, alpha=0.25)
+    ax_reward.tick_params(labelsize=8)
+
+    if len(rewards_history) > 0:
+        ax_reward.plot(
+            rewards_history,
+            color="cyan",
+            linewidth=1.4,
+            alpha=0.70,
+            label="reward"
+        )
+
+        if len(rewards_history) >= 10:
+            moving = np.convolve(
+                rewards_history,
+                np.ones(10) / 10,
+                mode="valid"
+            )
+
+            ax_reward.plot(
+                range(9, len(rewards_history)),
+                moving,
+                color="yellow",
+                linewidth=2.6,
+                label="média móvel"
+            )
+
+        ax_reward.legend(loc="upper left", fontsize=8, framealpha=0.25)
+
+
+def draw_metrics_graph():
+    ax_metrics.clear()
+
+    ax_metrics.set_title("Exploração vs sucesso recente", fontsize=12, pad=8)
+    ax_metrics.set_xlabel("Episódio", fontsize=9)
+    ax_metrics.set_ylabel("%", fontsize=9)
+    ax_metrics.set_ylim(0, 105)
+    ax_metrics.grid(True, alpha=0.25)
+    ax_metrics.tick_params(labelsize=8)
+
+    if len(rewards_history) > 0:
+        epsilon_line = []
+
+        for i in range(len(rewards_history)):
+            estimated = max(epsilon_min, 1.0 * (epsilon_decay ** i))
+            epsilon_line.append(estimated * 100)
+
+        ax_metrics.plot(
+            epsilon_line,
+            color="orange",
+            linewidth=2,
+            linestyle="--",
+            label="exploração epsilon"
+        )
+
+        if len(episode_success_full) > 0:
+            window_rates = []
+            for i in range(len(episode_success_full)):
+                window = episode_success_full[max(0, i - 49):i + 1]
+                rate = sum(window) / len(window) * 100
+                window_rates.append(rate)
+
+            ax_metrics.plot(
+                window_rates,
+                color="lime",
+                linewidth=2.5,
+                label="sucesso últimos 50"
+            )
+
+        ax_metrics.legend(loc="upper right", fontsize=8, framealpha=0.25)
+
+
+def draw_value_heatmap():
+    global colorbar
+
+    ax_value.clear()
+
+    mode = has_package
+
+    if mode == 0:
+        title = "Heatmap da Q-table | buscando pacote"
+    else:
+        title = "Heatmap da Q-table | carregando pacote"
+
+    ax_value.set_title(title, fontsize=12, pad=8)
+
+    values = np.zeros((GRID_SIZE, GRID_SIZE))
+
+    for i in range(GRID_SIZE):
+        for j in range(GRID_SIZE):
+            pos = (i, j)
+
+            if pos in OBSTACLES:
+                values[i, j] = -999
+            else:
+                values[i, j] = get_value(pos, mode)
+
+    masked_values = np.ma.masked_where(values == -999, values)
+
+    finite_values = values[values != -999]
+
+    if len(finite_values) > 0:
+        vmin = np.percentile(finite_values, 5)
+        vmax = np.percentile(finite_values, 95)
+
+        if abs(vmax - vmin) < 0.001:
+            vmax = vmin + 1
+    else:
+        vmin, vmax = -1, 1
+
+    heatmap = ax_value.imshow(
+        masked_values,
+        cmap="viridis",
+        interpolation="nearest",
+        vmin=vmin,
+        vmax=vmax
+    )
+
+    # Obstáculos por cima: evita falhas pretas por NaN/interpolação
+    for obs in OBSTACLES:
+        ax_value.add_patch(
+            plt.Rectangle(
+                (obs[1] - 0.5, obs[0] - 0.5),
+                1,
+                1,
+                color="black",
+                alpha=0.85
+            )
+        )
+
+    ax_value.plot(
+        state[1],
+        state[0],
+        "o",
+        color="white",
+        markersize=8
+    )
+
+    ax_value.set_xticks([])
+    ax_value.set_yticks([])
+
+    ax_value.text(
+        0.02,
+        -0.07,
+        "Mais claro = maior valor esperado. Preto = obstáculo.",
+        transform=ax_value.transAxes,
+        fontsize=9
+    )
+
+    ax_value.text(
+        GRID_SIZE - 1,
+        0,
+        "ALTO",
+        color="white",
+        fontsize=8,
+        ha="right",
+        va="top"
+    )
+
+    ax_value.text(
+        GRID_SIZE - 1,
+        GRID_SIZE - 1,
+        "BAIXO",
+        color="white",
+        fontsize=8,
+        ha="right",
+        va="bottom"
+    )
+
+    # Colorbar única e estável
+    if colorbar is None:
+        colorbar = fig.colorbar(
+            heatmap,
+            ax=ax_value,
+            fraction=0.035,
+            pad=0.02
+        )
+        colorbar.set_label("Valor do estado", fontsize=8)
+        colorbar.ax.tick_params(labelsize=7)
+    else:
+        colorbar.update_normal(heatmap)
+
+
+def draw_sensors_panel():
+    ax_sensors.clear()
+
+    ax_sensors.set_title("Sensores do robô", fontsize=12, fontweight="bold", pad=8)
+    ax_sensors.set_xlim(0, 1)
+    ax_sensors.set_ylim(0, 10)
+    ax_sensors.axis("off")
+
+    radar, danger, target_dir, target_vector = get_all_sensors(state, has_package)
+
+    y = 9.35
+
+    ax_sensors.text(
+        0.02,
+        y,
+        "Sensor 1 — Radar de obstáculos",
+        fontsize=9.5,
+        fontweight="bold"
+    )
+
+    y -= 0.60
+
+    names = ["Cima", "Baixo", "Esq.", "Dir."]
+
+    for name, value in zip(names, radar):
+        ax_sensors.text(0.02, y, name, fontsize=8.5)
+
+        ax_sensors.barh(
+            y,
+            value,
+            height=0.22,
+            color="yellow",
+            alpha=0.85
+        )
+
+        ax_sensors.text(
+            0.74,
+            y,
+            f"{value:.2f}",
+            fontsize=8
+        )
+
+        y -= 0.42
+
+    y -= 0.30
+
+    ax_sensors.text(
+        0.02,
+        y,
+        "Sensor 2 — Risco próximo",
+        fontsize=9.5,
+        fontweight="bold"
+    )
+
+    y -= 0.50
+
+    risk_color = "red" if danger > 0.45 else "lime"
+
+    ax_sensors.barh(
+        y,
+        danger,
+        height=0.30,
+        color=risk_color,
+        alpha=0.85
+    )
+
+    ax_sensors.text(
+        0.02,
+        y - 0.38,
+        f"nível de risco: {danger:.2f}",
+        fontsize=8.5
+    )
+
+    y -= 1.10
+
+    ax_sensors.text(
+        0.02,
+        y,
+        "Sensor 3 — Bússola do alvo",
+        fontsize=9.5,
+        fontweight="bold"
+    )
+
+    y -= 0.50
+
+    target_name = "PACOTE" if has_package == 0 else "HOSPITAL"
+    target = PACKAGE if has_package == 0 else HOSPITAL
+
+    ax_sensors.text(
+        0.02,
+        y,
+        f"alvo: {target_name}",
+        fontsize=8.5
+    )
+
+    y -= 0.40
+
+    ax_sensors.text(
+        0.02,
+        y,
+        f"direção: {DIRECTION_NAMES[target_dir]}",
+        fontsize=8.5
+    )
+
+    y -= 0.40
+
+    ax_sensors.text(
+        0.02,
+        y,
+        f"distância: {manhattan(state, target)}",
+        fontsize=8.5
+    )
+
+    y -= 0.80
+
+    ax_sensors.text(
+        0.02,
+        y,
+        "Uso didático dos sensores:",
+        fontsize=9.5,
+        fontweight="bold"
+    )
+
+    y -= 0.45
+
+    sensor_note = (
+        "• Radar mostra espaço livre\n"
+        "• Risco mostra perigo\n"
+        "• Bússola mostra objetivo\n\n"
+        "Nesta versão, a Q-table\n"
+        "decide por posição + pacote.\n"
+        "Os sensores ajudam a explicar\n"
+        "percepção robótica."
+    )
+
+    ax_sensors.text(
+        0.02,
+        y,
+        sensor_note,
+        fontsize=8.2,
+        va="top"
+    )
+
+
+def draw_info_panel():
+    ax_info.clear()
+    ax_info.axis("off")
+
+    success_rate = 0
+    if len(success_history) > 0:
+        success_rate = sum(success_history) / len(success_history) * 100
+
+    mission = "Buscar pacote" if has_package == 0 else "Entregar no hospital"
+
+    if success_rate < 15:
+        status = "PERDIDO"
+        color = "red"
+    elif success_rate < 40:
+        status = "EXPLORANDO"
+        color = "orange"
+    elif success_rate < 75:
+        status = "APRENDENDO"
+        color = "yellow"
+    else:
+        status = "DOMINANDO"
+        color = "lime"
+
+    info = (
+        f"EP {episode}/{episodes} | {mission}\n"
+        f"Status: {status}\n"
+        f"Epsilon: {epsilon:.3f}\n"
+        f"Reward atual: {total_reward}\n"
+        f"Passos: {step_counter}/{max_steps}\n"
+        f"Sucesso recente: {success_rate:.1f}%\n\n"
+        "Estado: posição + pacote\n"
+        "Ação: ↑ ↓ ← →\n"
+        "Política: setas no mapa\n"
+        "Valor: heatmap da Q-table"
+    )
+
+    ax_info.text(
+        0.02,
+        0.98,
+        info,
+        va="top",
+        fontsize=8.6,
+        family="sans-serif",
+        color="white",
+        linespacing=1.25
+    )
+
+    ax_info.text(
+        0.02,
+        0.66,
+        status,
+        fontsize=12,
+        fontweight="bold",
+        color=color
+    )
+
+
+# =========================================================
+# LOOP
+# =========================================================
+
+def update(frame):
+    global episode
+    global state
+    global has_package
+    global step_counter
+    global total_reward
+    global epsilon
+    global training_finished
+    global current_path
+
+    if not training_finished:
+
+        steps_per_frame = 35
+
+        for _ in range(steps_per_frame):
+
+            if episode >= episodes:
+                training_finished = True
+                break
+
+            action = choose_action(state, has_package)
+
+            next_state, next_has_package, reward, done = environment_step(
+                state,
+                has_package,
+                action
+            )
+
+            x, y = state
+            nx, ny = next_state
+
+            old_q = q_table[x, y, has_package, action]
+            future_q = np.max(q_table[nx, ny, next_has_package])
+
+            q_table[x, y, has_package, action] = old_q + alpha * (
+                reward + gamma * future_q - old_q
+            )
+
+            state = next_state
+            has_package = next_has_package
+
+            total_reward += reward
+            step_counter += 1
+            current_path.append(state)
+
+            if done or step_counter >= max_steps:
+
+                rewards_history.append(total_reward)
+                success_history.append(1 if done else 0)
+                episode_success_full.append(1 if done else 0)
+
+                episode += 1
+
+                state = START
+                has_package = 0
+                step_counter = 0
+                total_reward = 0
+                current_path = [START]
+
+                epsilon = max(
+                    epsilon_min,
+                    epsilon * epsilon_decay
+                )
+
+    draw_map()
+    draw_reward_graph()
+    draw_metrics_graph()
+    draw_value_heatmap()
+    draw_sensors_panel()
+    draw_info_panel()
+
+
+ani = animation.FuncAnimation(
+    fig,
+    update,
+    interval=50,
+    cache_frame_data=False
+)
+
+# Não usar tight_layout com muitos painéis + colorbar + suptitle.
+fig.subplots_adjust(
+    left=0.03,
+    right=0.97,
+    top=0.91,
+    bottom=0.06,
+    wspace=0.42,
+    hspace=0.55
+)
+
+plt.show()
