@@ -44,6 +44,8 @@ source venv/bin/activate
 
 pip install numpy matplotlib
 
+pip install pygame numpy matplotlib torch
+
 # Configuração
 
 cd ~/curso_rl/projeto_final
