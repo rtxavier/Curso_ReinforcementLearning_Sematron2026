@@ -46,7 +46,7 @@ pip install numpy matplotlib
 
 # Configuração
 
-cd ~/curso_rl/aula1_gridworld
+cd ~/curso_rl/projeto_final
 
 # Criar ambiente
 
