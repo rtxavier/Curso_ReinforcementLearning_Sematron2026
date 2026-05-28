@@ -44,7 +44,7 @@ source venv/bin/activate
 
 pip install numpy matplotlib
 
-pip install pygame numpy matplotlib torch
+pip install "numpy<2"
 
 # Configuração
 
