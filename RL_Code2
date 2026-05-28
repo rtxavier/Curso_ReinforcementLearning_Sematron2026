@@ -6,12 +6,11 @@ from collections import deque
 
 # =========================================================
 # RESCUEBOT RL 2.0
-# Versão estável para aula:
-# - cenário V1
+# - cenário 
 # - Q-table simples
 # - 3 sensores visuais
-# - heatmap corrigido
-# - dashboard sem sobreposição
+# - heatmap 
+# - dashboard 
 # =========================================================
 
 GRID_SIZE = 12
